@@ -1,0 +1,21 @@
+name: keepalive
+# GitHub 会在仓库 60 天无任何提交后停用 schedule 触发器，
+# 每月一次空提交保持仓库活跃，避免定时任务被静默关闭。
+on:
+  schedule:
+    - cron: '0 3 2 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: |
+          git config user.name "keepalive-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive $(date -u +%F)"
+          git push

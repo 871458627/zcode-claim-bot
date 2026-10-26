@@ -1,0 +1,36 @@
+name: zcode-claim
+# UTC 01:00 / 13:00 = 北京时间 09:00 / 21:00，每天两次
+on:
+  schedule:
+    - cron: '0 1,13 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # 官方 Action 固定到 commit SHA，防止 tag 被劫持（供应链安全）
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Restore state
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: state/
+          key: claim-state-${{ github.run_id }}
+          restore-keys: |
+            claim-state-
+
+      - name: Check & claim
+        env:
+          ZCODE_JWT: ${{ secrets.ZCODE_JWT }}
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          STATE_FILE: state/state.json
+        run: node claim.mjs
