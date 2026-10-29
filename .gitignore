@@ -1,3 +1,6 @@
 state.json
+state-local.json
 state/
+local-check.log
+notify.local
 node_modules/
