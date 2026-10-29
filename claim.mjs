@@ -1,36 +1,57 @@
 #!/usr/bin/env node
-// ZCode 活动额度监控与领取（云端版）
+// ZCode 活动额度监控与领取（v3）
 // 接口协议逆向自 ZCode 桌面客户端 v3.16.3，与本机客户端行为一致。
 //
-// 通知策略:
-//   - 成功领取到免费 token 时才推送：具体数量 + 适用模型 + 有效期 + 使用规则
-//   - 其余情况（无可领 / 需客户端验证码 / 临时失败）一律静默，只写日志
-//   - 例外：凭证失效仍推送并 exit 2（否则 bot 静默失联无人知晓）
+// 通知策略 v3（2026-10-29 按用户要求调整）:
+//   - 自动领取成功 → 推送：具体数量 + 适用模型 + 有效期 + 使用规则
+//   - 发现可领活动但被人机验证拦截 → 立即推送（同一活动只推一次），人工在客户端 5 秒领取
+//   - marketing/touch 出现新活动投放 → 立即推送（探测源，可能早于领取列表上线）
+//   - 无任何可领 → 静默；唯一例外：凭证失效仍推送并 exit 2
 //
-// 用法:
-//   ZCODE_JWT=<zcodejwttoken> node claim.mjs
-// 可选环境变量:
-//   NOTIFY_WEBHOOK   推送渠道（Server酱/Bark/Telegram/企业微信群机器人/钉钉/飞书，其它 URL 走通用 JSON POST）
-//   STATE_FILE       去重状态文件路径（默认 ./state.json，配合 Actions cache 使用）
-//   DEVICE_MID       设备标识（默认随机 UUID，仅用于服务端埋点）
-//   PLATFORM         X-Platform 头（默认 win32-x64，与导出凭证的客户端保持一致）
-//   DRY_RUN          设为 1 时只查询不领取
+// 凭证来源（优先级）: 环境变量 ZCODE_JWT → 本机 ~/.zcode/v2/credentials.json（本地任务零维护）
+// 推送渠道: 环境变量 NOTIFY_WEBHOOK → 脚本同目录 notify.local 文件（本地任务用）
 //
-// 退出码: 0 正常（无论是否领到）; 1 预览/未知错误（触发 GitHub 失败邮件）; 2 凭证失效（需重新导出）
+// 用法: node claim.mjs
+// 可选: STATE_FILE（默认 ./state.json）、DEVICE_MID、PLATFORM、DRY_RUN=1
+// 退出码: 0 正常; 1 未知错误; 2 凭证失效
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 
 const BASE = 'https://zcode.z.ai';
 const APP_VERSION = '3.16.3';
 const PLATFORM = process.env.PLATFORM || 'win32-x64';
-const JWT = (process.env.ZCODE_JWT || '').trim();
 const STATE_FILE = process.env.STATE_FILE || 'state.json';
 const DRY_RUN = process.env.DRY_RUN === '1';
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+function resolveJwt() {
+  const env = (process.env.ZCODE_JWT || '').trim();
+  if (env) return env;
+  try {
+    const p = join(homedir(), '.zcode', 'v2', 'credentials.json');
+    const creds = JSON.parse(readFileSync(p, 'utf8'));
+    if (creds.zcodejwttoken) return creds.zcodejwttoken;
+  } catch { /* no local client */ }
+  return '';
+}
+const JWT = resolveJwt();
+
+function resolveWebhook() {
+  const env = (process.env.NOTIFY_WEBHOOK || '').trim();
+  if (env) return env;
+  try {
+    const local = join(HERE, 'notify.local');
+    if (existsSync(local)) return readFileSync(local, 'utf8').trim();
+  } catch { /* best effort */ }
+  return '';
+}
 
 if (!JWT) {
-  console.error('missing ZCODE_JWT');
+  console.error('no ZCODE_JWT (env) and no local credentials.json');
   process.exit(2);
 }
 
@@ -56,7 +77,7 @@ async function call(url, opt = {}, retries = 1) {
       const res = await fetch(url, { ...opt, headers: h });
       const text = await res.text();
       let json = null;
-      try { json = JSON.parse(text); } catch { /* non-json body */ }
+      try { json = JSON.parse(text); } catch { /* non-json */ }
       return { status: res.status, json, text };
     } catch (e) {
       if (i >= retries) throw e;
@@ -90,7 +111,7 @@ function loadState() {
   try {
     if (existsSync(STATE_FILE)) return JSON.parse(readFileSync(STATE_FILE, 'utf8'));
   } catch { /* corrupted state starts fresh */ }
-  return { claimed: [], reported: [] };
+  return { claimed: [], reported: [], deliveries: [] };
 }
 
 function saveState(s) {
@@ -99,7 +120,7 @@ function saveState(s) {
 }
 
 async function notify(title, body) {
-  const url = (process.env.NOTIFY_WEBHOOK || '').trim();
+  const url = resolveWebhook();
   if (!url) return;
   const text = `${title}\n${body}`;
   let opt;
@@ -138,9 +159,22 @@ function flushSummary() {
 
 const now = () => new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
 
-async function main() {
-  out(`ZCode claim bot @ ${now()}`);
+function planBrief(p) {
+  const ents = (p.entitlements || [])
+    .map(e => `${(e.show_name || '').trim()} ${fmtUnits(Number(e.grant_units) || 0)}${e.unit_type || ''}`.trim())
+    .join(' + ');
+  return `${(p.name || p.plan_id).trim()}（${ents || '内容未知'}）`;
+}
 
+async function main() {
+  out(`ZCode claim bot v3 @ ${now()}`);
+
+  const state = loadState();
+  state.claimed ||= [];
+  state.reported ||= [];
+  state.deliveries ||= [];
+
+  // ---------- 源 1: billing/preview（可领活动列表） ----------
   const pv = await call(`${BASE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`);
   if (pv.status === 401 || pv.status === 403) {
     await notify('ZCode 凭证已失效', '云端脚本无法通过鉴权（preview 401）。请在装有 ZCode 客户端的电脑重新导出 zcodejwttoken，并更新 GitHub 仓库的 ZCODE_JWT secret。');
@@ -156,14 +190,6 @@ async function main() {
 
   const plans = pv.json?.data?.plans || [];
   out(`claimable plans: ${plans.length}${DRY_RUN ? ' (DRY_RUN)' : ''}`);
-  if (plans.length === 0) {
-    out('RESULT: nothing_to_claim');
-    return;
-  }
-
-  const state = loadState();
-  state.claimed ||= [];
-  state.reported ||= [];
 
   for (const plan of plans) {
     const ents = plan.entitlements || [];
@@ -197,16 +223,46 @@ async function main() {
       ].join('\n');
       await notify(title, body);
     } else if (cl.status === 401 || cl.status === 403) {
-      // preview 已通过而 claim 被拒 => 该活动启用了人机验证，只能客户端内领取；按策略静默
-      state.reported.push(plan.plan_id);
-      out(`NEEDS_CLIENT (silent): ${plan.plan_id}`);
+      // 被人机验证拦截 → 立即推送（每活动一次），人工 5 秒领取
+      out(`NEEDS_CLIENT: ${plan.plan_id}`);
+      if (!state.reported.includes(plan.plan_id)) {
+        state.reported.push(plan.plan_id);
+        const valid = ents.some(e => (e.period || '') !== '' && e.period !== 'one_time')
+          ? '限时/限量活动，建议尽快领取'
+          : '限时活动，建议尽快领取';
+        await notify('ZCode 发现可领活动，请你点一下 🎁',
+          `${planBrief(plan)}\n${valid}\n\n领取方式：打开 ZCode 客户端 → 左下角活动卡片 → 点击领取（约 5 秒，平台要求客户端内人机验证，脚本无法代领）。`);
+      }
     } else {
-      out(`CLAIM FAILED (silent, will retry next run): HTTP ${cl.status} ${(cl.json?.msg || cl.text).slice(0, 200)} | ${plan.plan_id}`);
+      out(`CLAIM FAILED (will retry next run): HTTP ${cl.status} ${(cl.json?.msg || cl.text).slice(0, 200)} | ${plan.plan_id}`);
     }
   }
 
+  // ---------- 源 2: marketing/touch（活动卡片投放，可能早于领取列表） ----------
+  try {
+    const mt = await call(`${BASE}/api/v1/marketing/touch?seq=1`);
+    if (mt.status === 200 && mt.json?.code === 0) {
+      const deliveries = mt.json?.data?.deliveries || [];
+      out(`marketing deliveries: ${deliveries.length}`);
+      for (const d of deliveries) {
+        const id = d.campaign_id || d.id || d.delivery_id || JSON.stringify(d).slice(0, 80);
+        if (state.deliveries.includes(id)) continue;
+        state.deliveries.push(id);
+        if (state.deliveries.length > 100) state.deliveries = state.deliveries.slice(-50);
+        const brief = d.title || d.name || d.campaign_name || id;
+        out(`NEW DELIVERY: ${brief}`);
+        await notify('ZCode 活动卡片有新投放 📣',
+          `${brief}\n\n详情打开 ZCode 客户端左下角活动卡片查看；若可领取，客户端内点击即可。`);
+      }
+    } else {
+      out(`marketing/touch: HTTP ${mt.status} (ignored)`);
+    }
+  } catch (e) {
+    out(`marketing/touch error (ignored): ${e.message}`);
+  }
+
   saveState(state);
-  out(`RESULT: claimed=${state.claimed.length} needs_client=${state.reported.length}`);
+  out(`RESULT: claimed=${state.claimed.length} needs_client=${state.reported.length} deliveries_seen=${state.deliveries.length}`);
 }
 
 try {
