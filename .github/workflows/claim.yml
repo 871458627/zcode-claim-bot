@@ -1,8 +1,9 @@
 name: zcode-claim
-# UTC 01:00 / 13:00 = 北京时间 09:00 / 21:00，每天两次
+# 每 2 小时检查一次（GitHub 免费版 cron 有数小时延迟，属正常；
+# 本机开机时段另有 Windows 计划任务每 30 分钟兜底，见 local-check.cmd）
 on:
   schedule:
-    - cron: '0 1,13 * * *'
+    - cron: '0 */2 * * *'
   workflow_dispatch: {}
 
 permissions:
