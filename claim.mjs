@@ -1,8 +1,13 @@
 #!/usr/bin/env node
-// ZCode 活动额度监控与领取（v3）
+// ZCode 活动额度监控与领取（v3.1）
 // 接口协议逆向自 ZCode 桌面客户端 v3.16.3，与本机客户端行为一致。
 //
-// 通知策略 v3（2026-10-29 按用户要求调整）:
+// v3.1 诚实原则：bot 读不到账户账本（balance/current/claim 全被人机验证闸锁死），
+// 因此绝不断言"你已/未领取"，只播报可验证事实：
+//   - "出现"= 可领列表里出现了它；"消失"= 列表里不再有它（已领取或批次结束，二选一）
+//   - "已到账"仅当 claim 返回 code 0（服务端确认），响应原文写入日志供核验
+//
+// 通知策略 v3.1（2026-10-29 定版）:
 //   - 自动领取成功 → 推送：具体数量 + 适用模型 + 有效期 + 使用规则
 //   - 发现可领活动但被人机验证拦截 → 立即推送（同一活动只推一次），人工在客户端 5 秒领取
 //   - marketing/touch 出现新活动投放 → 立即推送（探测源，可能早于领取列表上线）
@@ -167,12 +172,14 @@ function planBrief(p) {
 }
 
 async function main() {
-  out(`ZCode claim bot v3 @ ${now()}`);
+  out(`ZCode claim bot v3.1 @ ${now()}`);
 
   const state = loadState();
-  state.claimed ||= [];
-  state.reported ||= [];
+  state.claimed ||= [];   // 仅含服务端返回 code 0 确认到账的
+  state.reported ||= [];  // 尝试过领取但被人机验证拦截的（不代表未领取）
   state.deliveries ||= [];
+  state.closed ||= [];    // 已播报过"消失"的 plan
+  state.last_plans ||= []; // 上一轮 preview 里见到的 plan 列表快照
 
   // ---------- 源 1: billing/preview（可领活动列表） ----------
   const pv = await call(`${BASE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`);
@@ -191,6 +198,17 @@ async function main() {
   const plans = pv.json?.data?.plans || [];
   out(`claimable plans: ${plans.length}${DRY_RUN ? ' (DRY_RUN)' : ''}`);
 
+  // 消失事件（可验证的中性事实）：上一轮在列表、本轮不在 => 已领取或活动结束，无法区分，如实播报
+  const currentIds = plans.map(p => p.plan_id);
+  for (const gid of state.last_plans || []) {
+    if (!currentIds.includes(gid) && !state.closed.includes(gid)) {
+      state.closed.push(gid);
+      out(`PLAN GONE: ${gid}`);
+      await notify('ZCode 活动已关闭 🔒', `${gid}\n\n它已从可领列表消失。只有两种可能：你已领取成功，或该批次结束。可打开客户端额度页核实到账情况。`);
+    }
+  }
+  state.last_plans = currentIds;
+
   for (const plan of plans) {
     const ents = plan.entitlements || [];
     if (state.claimed.includes(plan.plan_id)) { out(`SKIP (already claimed): ${plan.plan_id}`); continue; }
@@ -206,6 +224,7 @@ async function main() {
     if (cl.status === 200 && cl.json?.code === 0) {
       state.claimed.push(plan.plan_id);
       out(`CLAIMED: ${plan.plan_id}`);
+      out(`CLAIM RAW: ${JSON.stringify(cl.json).slice(0, 800)}`);
       const title = `ZCode 已到账：${ents.map(e => `${fmtUnits(Number(e.grant_units) || 0)}${e.unit_type || ''}`).join(' + ')}`;
       const cp = cl.json?.data?.plan || {};
       const validity = Number.isFinite(cp.starts_at) && Number.isFinite(cp.ends_at)
@@ -227,11 +246,8 @@ async function main() {
       out(`NEEDS_CLIENT: ${plan.plan_id}`);
       if (!state.reported.includes(plan.plan_id)) {
         state.reported.push(plan.plan_id);
-        const valid = ents.some(e => (e.period || '') !== '' && e.period !== 'one_time')
-          ? '限时/限量活动，建议尽快领取'
-          : '限时活动，建议尽快领取';
-        await notify('ZCode 发现可领活动，请你点一下 🎁',
-          `${planBrief(plan)}\n${valid}\n\n领取方式：打开 ZCode 客户端 → 左下角活动卡片 → 点击领取（约 5 秒，平台要求客户端内人机验证，脚本无法代领）。`);
+        await notify('ZCode 发现可领活动 🎁（若你已领取请忽略）',
+          `${planBrief(plan)}\n\n· 领取方式：打开 ZCode 客户端 → 左下角活动卡片 → 点击领取（约 5 秒，平台要求客户端内人机验证，脚本无法代领）\n· 本条无法确认你是否已领取过：bot 读不到账户账本（平台锁死），仅如实转述"可领列表里出现了它"`);
       }
     } else {
       out(`CLAIM FAILED (will retry next run): HTTP ${cl.status} ${(cl.json?.msg || cl.text).slice(0, 200)} | ${plan.plan_id}`);
