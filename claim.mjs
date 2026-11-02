@@ -180,10 +180,27 @@ async function main() {
   state.deliveries ||= [];
   state.closed ||= [];    // 已播报过"消失"的 plan
   state.last_plans ||= []; // 上一轮 preview 里见到的 plan 列表快照
+  state.retired = state.retired || false; // preview 端点被平台关闭的通知只发一次
 
   // ---------- 源 1: billing/preview（可领活动列表） ----------
   const pv = await call(`${BASE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${PLATFORM}`);
   if (pv.status === 401 || pv.status === 403) {
+    // 区分两种 401：configs 能过 => 凭证有效、preview 端点被平台关闭（2026-10-31 起）；
+    // configs 也 401 => 凭证真的失效
+    try {
+      const cf = await call(`${BASE}/api/v1/client/configs`);
+      if (cf.status === 200 && cf.json?.code === 0) {
+        out('preview 401 but configs OK => endpoint retired by platform');
+        if (!state.retired) {
+          state.retired = true;
+          saveState(state);
+          await notify('ZCode 领取接口已被平台关闭 ⚠️',
+            'billing/preview 对脚本回放返回 401（客户端 3.17 起服务端收紧）。\n检测层暂时失效，本通知只发一次。\n可继续用客户端活动卡片手动领取；恢复方案讨论中。');
+        }
+        out('RESULT: preview_retired');
+        return;
+      }
+    } catch { /* configs check failed, fall through to credential_invalid */ }
     await notify('ZCode 凭证已失效', '云端脚本无法通过鉴权（preview 401）。请在装有 ZCode 客户端的电脑重新导出 zcodejwttoken，并更新 GitHub 仓库的 ZCODE_JWT secret。');
     out('RESULT: credential_invalid');
     process.exitCode = 2;
